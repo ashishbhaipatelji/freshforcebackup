@@ -20,15 +20,10 @@ from flask import Flask
 from telethon.utils import get_display_name
 import re
 from telethon import TelegramClient, events, Button
+from telethon.utils import get_peer_id
 from decouple import config
-from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors.rpcerrorlist import UserNotParticipantError
 from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.functions.messages import GetChatInviteImportersRequest
-from telethon.tl.types import InputUserEmpty
-from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import ChatInviteAlready
-from datetime import datetime, timezone
 
 logging.basicConfig(
     format="[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s", level=logging.INFO
@@ -83,8 +78,10 @@ channel = channel.lstrip("@")
 # CHANNEL_LINK overrides the button URL; otherwise public usernames are used.
 if channel_link:
     join_url = channel_link.strip()
+    if not join_url.startswith(("https://t.me/", "http://t.me/")):
+        raise ValueError("CHANNEL_LINK must be a Telegram t.me invite or public link")
 elif channel.lstrip("-").isdigit():
-    join_url = "https://t.me/"
+    raise ValueError("For a numeric private CHANNEL ID, set CHANNEL_LINK to its t.me invite URL")
 else:
     join_url = f"https://t.me/{channel}"
 
@@ -203,37 +200,41 @@ async def resolve_target():
         raise
 
 
-async def has_pending_join_request(user_id):
-    """Return True when the user has a pending request for the configured target.
+# Telegram does not allow bot accounts to list pending join requests via
+# GetChatInviteImportersRequest. Track join-request updates delivered to this bot.
+# This is in-memory: requests already pending before startup are not discoverable.
+pending_join_requests = {}  # user_id -> timestamp
 
-    Telegram only exposes pending-request lists to admins with suitable access.
-    The bot must be an administrator of the target channel/group.
-    """
+
+@BotzHub.on(events.Raw)
+async def track_join_request(update):
+    if update.__class__.__name__ != "UpdateBotChatInviteRequester":
+        return
     try:
-        result = await BotzHub(GetChatInviteImportersRequest(
-            peer=target_entity,
-            requested=True,
-            offset_date=datetime(1970, 1, 1, tzinfo=timezone.utc),
-            offset_user=InputUserEmpty(),
-            limit=100,
-        ))
-        return any(getattr(item, "user_id", None) == user_id for item in result.importers)
+        peer_id = get_peer_id(update.peer)
+        target_id = get_peer_id(target_entity)
+        if peer_id != target_id:
+            return
+        user_id = int(update.user_id)
+        # Telegram sends this update when a user requests to join.
+        pending_join_requests[user_id] = int(getattr(update, "date", 0) or 0)
+        log.info("Tracked pending join request for user %s", user_id)
     except Exception as e:
-        log.warning("Could not inspect pending join requests for user %s: %s", user_id, e)
-        return False
+        log.warning("Could not process join-request update: %s", e)
 
 
-# Membership check: actual members pass; users with a pending join request are
-# temporarily treated as subscribed, as requested.
+# Membership check: members pass; a pending request received while this process
+# is running is temporarily treated as subscribed.
 async def get_user_join(user_id):
     try:
         await BotzHub(GetParticipantRequest(channel=target_entity, participant=user_id))
+        pending_join_requests.pop(int(user_id), None)
         return True
     except UserNotParticipantError:
-        return await has_pending_join_request(user_id)
+        return int(user_id) in pending_join_requests
     except Exception as e:
         log.warning("Membership check failed for user %s: %s", user_id, e)
-        return await has_pending_join_request(user_id)
+        return int(user_id) in pending_join_requests
 
 
 @BotzHub.on(events.ChatAction)
@@ -256,6 +257,7 @@ async def _(event):
         fullname = f"{name} {last}" if last else name
         username = f"@{uu}" if (uu := user.username) else mention
         x = await get_user_join(user.id)
+        pending_join_requests.pop(int(user.id), None)
         if x is True:
             msg = welcome_msg.format(
                 mention=mention,
