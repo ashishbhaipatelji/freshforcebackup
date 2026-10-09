@@ -138,8 +138,11 @@ def schedule_message_delete(message, delay=120):
 
 
 async def send_temporary_message(event, message, buttons=None, delay=120):
-    """Send a bot message and automatically delete it after 2 minutes."""
+    """Send a message; auto-delete only in groups, never in the bot's PM."""
     sent = await event.reply(message, buttons=buttons)
+    # Keep bot replies in private chats (including /start) permanently.
+    if event.is_private:
+        return sent
     schedule_message_delete(sent, delay)
     return sent
 
