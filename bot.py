@@ -24,6 +24,11 @@ from decouple import config
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors.rpcerrorlist import UserNotParticipantError
 from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.functions.messages import GetChatInviteImportersRequest
+from telethon.tl.types import InputUserEmpty
+from telethon.tl.functions.messages import CheckChatInviteRequest
+from telethon.tl.types import ChatInviteAlready
+from datetime import datetime, timezone
 
 logging.basicConfig(
     format="[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s", level=logging.INFO
@@ -46,6 +51,8 @@ log.info("Starting...")
 try:
     bottoken = config("BOT_TOKEN")
     xchannel = config("CHANNEL")
+    # Optional clickable join link. Set this for private channels/groups.
+    channel_link = config("CHANNEL_LINK", default="")
     welcome_msg = config("WELCOME_MSG")
     welcome_not_joined = config("WELCOME_NOT_JOINED")
     on_join = config("ON_JOIN", cast=bool)
@@ -64,8 +71,25 @@ except Exception as e:
     log.error("Bot is quiting...")
     exit()
 
-channel = xchannel.replace("@", "")
+# CHANNEL accepts a public @username, a t.me public URL, or a numeric chat ID
+# (for a private channel/group, use its -100... ID and ensure the bot is an admin).
+channel = xchannel.strip()
+if channel.startswith("https://t.me/"):
+    channel = channel.removeprefix("https://t.me/").strip("/")
+elif channel.startswith("http://t.me/"):
+    channel = channel.removeprefix("http://t.me/").strip("/")
+channel = channel.lstrip("@")
+
+# CHANNEL_LINK overrides the button URL; otherwise public usernames are used.
+if channel_link:
+    join_url = channel_link.strip()
+elif channel.lstrip("-").isdigit():
+    join_url = "https://t.me/"
+else:
+    join_url = f"https://t.me/{channel}"
+
 bot_self = BotzHub.loop.run_until_complete(BotzHub.get_me())
+target_entity = None
 
 
 # Auto-unmute timers: {(chat_id, user_id): asyncio.Task}
@@ -166,15 +190,50 @@ def start_unmute_timer(chat_id, user_id):
 
 
 
-# join check
-async def get_user_join(id):
-    ok = True
+# Resolve the required target once. For private targets, CHANNEL should be the
+# numeric -100... chat ID (the bot must be a member/admin); CHANNEL_LINK is the
+# invite URL shown to users. Public targets can use @username or t.me/username.
+async def resolve_target():
+    global target_entity
     try:
-        await BotzHub(GetParticipantRequest(channel=channel, participant=id))
-        ok = True
+        target_entity = await BotzHub.get_entity(int(channel) if channel.lstrip("-").isdigit() else channel)
+        log.info("Force-sub target resolved: %s", getattr(target_entity, "title", channel))
+    except Exception as e:
+        log.error("Cannot resolve CHANNEL=%r. Use @username for public targets or the numeric -100... ID for private targets. Error: %s", channel, e)
+        raise
+
+
+async def has_pending_join_request(user_id):
+    """Return True when the user has a pending request for the configured target.
+
+    Telegram only exposes pending-request lists to admins with suitable access.
+    The bot must be an administrator of the target channel/group.
+    """
+    try:
+        result = await BotzHub(GetChatInviteImportersRequest(
+            peer=target_entity,
+            requested=True,
+            offset_date=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            offset_user=InputUserEmpty(),
+            limit=100,
+        ))
+        return any(getattr(item, "user_id", None) == user_id for item in result.importers)
+    except Exception as e:
+        log.warning("Could not inspect pending join requests for user %s: %s", user_id, e)
+        return False
+
+
+# Membership check: actual members pass; users with a pending join request are
+# temporarily treated as subscribed, as requested.
+async def get_user_join(user_id):
+    try:
+        await BotzHub(GetParticipantRequest(channel=target_entity, participant=user_id))
+        return True
     except UserNotParticipantError:
-        ok = False
-    return ok
+        return await has_pending_join_request(user_id)
+    except Exception as e:
+        log.warning("Membership check failed for user %s: %s", user_id, e)
+        return await has_pending_join_request(user_id)
 
 
 @BotzHub.on(events.ChatAction)
@@ -205,10 +264,10 @@ async def _(event):
                 username=username,
                 name=name,
                 last=last,
-                channel=f"@{channel}",
+                channel=join_url,
                 count=count,
             )
-            butt = [Button.url("Channel", url=f"https://t.me/{channel}")]
+            butt = [Button.url("Channel", url=join_url)]
         else:
             msg = welcome_not_joined.format(
                 mention=mention,
@@ -217,11 +276,11 @@ async def _(event):
                 username=username,
                 name=name,
                 last=last,
-                channel=f"@{channel}",
+                channel=join_url,
                 count=count,
             )
             butt = [
-                Button.url("Channel", url=f"https://t.me/{channel}"),
+                Button.url("Channel", url=join_url),
                 Button.inline("UnMute Me", data=f"unmute_{user.id}"),
             ]
             await BotzHub.edit_permissions(
@@ -281,12 +340,12 @@ async def mute_on_msg(event):
                 username=username,
                 name=name,
                 last=last,
-                channel=f"@{channel}",
+                channel=join_url,
                 count=count,
             )
 
             butt = [
-                Button.url("Channel", url=f"https://t.me/{channel}"),
+                Button.url("Channel", url=join_url),
                 Button.inline(
                     "UnMute Me",
                     data=f"unmute_{event.sender_id}",
@@ -311,7 +370,7 @@ async def _(event):
         nm = event.sender.first_name
         if x is False:
             await event.answer(
-                f"You haven't joined @{channel} yet!", cache_time=0, alert=True
+                f"You haven't joined the required channel/group yet!", cache_time=0, alert=True
             )
         elif x is True:
             try:
@@ -323,7 +382,7 @@ async def _(event):
                 log.error(e)
                 return
             msg = f"Welcome to {(await event.get_chat()).title}, {nm}!\nGood to see you here!"
-            butt = [Button.url("Channel", url=f"https://t.me/{channel}")]
+            butt = [Button.url("Channel", url=join_url)]
             edited_msg = await event.edit(msg, buttons=butt)
             schedule_message_delete(edited_msg, 120)
     else:
@@ -338,13 +397,19 @@ async def _(event):
 async def strt(event):
     await send_temporary_message(
         event,
-        f"Hi. I'm a force subscribe bot made specially for @{channel}!\n\nCheckout @BotzHub :)",
+        f"Hi. I'm a force subscribe bot for the configured channel/group!\n\nCheckout @BotzHub :)",
         buttons=[
-            Button.url("Channel", url=f"https://t.me/{channel}"),
+            Button.url("Channel", url=join_url),
             Button.url("Repository", url="https://github.com/xditya/ForceSub"),
         ],
     )
 
+
+try:
+    BotzHub.loop.run_until_complete(resolve_target())
+except Exception:
+    log.error("ForceSub cannot start until CHANNEL is configured correctly.")
+    raise
 
 log.info("ForceSub Bot has started as @%s.\nDo visit @BotzHub!", bot_self.username)
 BotzHub.run_until_disconnected()
