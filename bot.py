@@ -217,7 +217,7 @@ async def track_join_request(update):
             return
         user_id = int(update.user_id)
         # Telegram sends this update when a user requests to join.
-        pending_join_requests[user_id] = int(getattr(update, "date", 0) or 0)
+        pending_join_requests[user_id] = True  # Only presence matters; date may be datetime.datetime.
         log.info("Tracked pending join request for user %s", user_id)
     except Exception as e:
         log.warning("Could not process join-request update: %s", e)
